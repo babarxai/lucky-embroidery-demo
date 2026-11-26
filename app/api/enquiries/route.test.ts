@@ -1,3 +1,5 @@
+(process.env as Record<string, string | undefined>).NODE_ENV = "test";
+
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
@@ -44,64 +46,65 @@ const validEnquiry = {
   projectDetails: "50 embroidered polos",
 };
 
-test("valid enquiry returns 201 in demo mode (safety switch off by default)", async () => {
-  const previous = process.env.ENQUIRIES_ENABLED;
-  delete process.env.ENQUIRIES_ENABLED;
-  try {
-    let called = false;
-    const response = await postEnquiryWithInsert(
-      JSON.stringify(validEnquiry),
-      async () => {
-        called = true;
-        return { error: null };
-      }
-    );
+test("valid enquiry returns 201 and persists trimmed fields", async () => {
+  const inserted: EnquiryInsert[] = [];
+  const response = await postEnquiryWithInsert(
+    JSON.stringify({
+      fullName: "  Jane Doe  ",
+      email: "  jane@example.com  ",
+      phone: "  555-0100  ",
+      service: "  Custom Embroidery  ",
+      projectDetails: "  50 embroidered polos  ",
+    }),
+    async (record) => {
+      inserted.push(record);
+      return { data: { id: "mock-uuid-1234" }, error: null };
+    }
+  );
 
-    assert.equal(response.status, 201);
-    assert.deepEqual(await response.json(), {
-      message: "Enquiry received. Thank you for getting in touch.",
-    });
-    assert.equal(called, false);
-  } finally {
-    process.env.ENQUIRIES_ENABLED = previous;
-  }
+  assert.equal(response.status, 201);
+  const data = await response.json();
+  assert.equal(data.message, "Enquiry received. Thank you for getting in touch.");
+  assert.equal(data.enquiryId, "mock-uuid-1234");
+  assert.equal(inserted.length, 1);
+  assert.equal(inserted[0].full_name, "Jane Doe");
+  assert.equal(inserted[0].email, "jane@example.com");
+  assert.equal(inserted[0].phone, "555-0100");
+  assert.equal(inserted[0].service, "Custom Embroidery");
+  assert.equal(inserted[0].project_details, "50 embroidered polos");
 });
 
-test("valid enquiry inserts trimmed fields and returns 201 when ENQUIRIES_ENABLED is true", async () => {
-  const previous = process.env.ENQUIRIES_ENABLED;
-  process.env.ENQUIRIES_ENABLED = "true";
-  try {
-    const inserted: EnquiryInsert[] = [];
-    const response = await postEnquiryWithInsert(
-      JSON.stringify({
-        fullName: "  Jane Doe  ",
-        email: "  jane@example.com  ",
-        phone: "  555-0100  ",
-        service: "  Custom Embroidery  ",
-        projectDetails: "  50 embroidered polos  ",
-      }),
-      async (record) => {
-        inserted.push(record);
-        return { error: null };
-      }
-    );
+test("duplicate idempotency key returns 201 without throwing error", async () => {
+  const response = await postEnquiryWithInsert(
+    JSON.stringify(validEnquiry),
+    async () => ({
+      data: null,
+      error: { code: "23505", message: "duplicate key value violates unique constraint" },
+    })
+  );
 
-    assert.equal(response.status, 201);
-    assert.deepEqual(await response.json(), {
-      message: "Enquiry received. Thank you for getting in touch.",
-    });
-    assert.deepEqual(inserted, [
-      {
-        full_name: "Jane Doe",
-        email: "jane@example.com",
-        phone: "555-0100",
-        service: "Custom Embroidery",
-        project_details: "50 embroidered polos",
-      },
-    ]);
-  } finally {
-    process.env.ENQUIRIES_ENABLED = previous;
-  }
+  assert.equal(response.status, 201);
+  const data = await response.json();
+  assert.equal(data.message, "Enquiry received. Thank you for getting in touch.");
+});
+
+test("honeypot bot submission returns 400", async () => {
+  let called = false;
+  const response = await postEnquiryWithInsert(
+    JSON.stringify({
+      ...validEnquiry,
+      faxNumber: "bot-automated-value",
+    }),
+    async () => {
+      called = true;
+      return { data: { id: "1" }, error: null };
+    }
+  );
+
+  assert.equal(response.status, 400);
+  assert.equal(called, false);
+  const data = await response.json();
+  assert.equal(data.message, "Automated submission detected. Verification failed.");
 });
 
 test("missing fullName returns 400", async () => {
@@ -208,14 +211,14 @@ test("oversized field returns 400", async () => {
 });
 
 test("field at the length limit returns 201", async () => {
-  const response = await postEnquiry(
-    JSON.stringify({ ...validEnquiry, projectDetails: "x".repeat(2000) })
+  const response = await postEnquiryWithInsert(
+    JSON.stringify({ ...validEnquiry, projectDetails: "x".repeat(2000) }),
+    async () => ({ data: { id: "len-test" }, error: null })
   );
 
   assert.equal(response.status, 201);
-  assert.deepEqual(await response.json(), {
-    message: "Enquiry received. Thank you for getting in touch.",
-  });
+  const data = await response.json();
+  assert.equal(data.message, "Enquiry received. Thank you for getting in touch.");
 });
 
 test("each field enforces its length limit", async () => {
@@ -295,8 +298,9 @@ test("accepts JSON content types with parameters and vendor suffix", async () =>
     "application/json; charset=utf-8",
     "application/vnd.api+json",
   ]) {
-    const response = await postEnquiry(
+    const response = await postEnquiryWithInsert(
       JSON.stringify(validEnquiry),
+      async () => ({ data: { id: "test" }, error: null }),
       contentType
     );
 
@@ -314,50 +318,59 @@ test("empty body returns 400", async () => {
 });
 
 test("database error returns 500 without exposing internal details", async () => {
-  const previous = process.env.ENQUIRIES_ENABLED;
-  process.env.ENQUIRIES_ENABLED = "true";
-  try {
-    const response = await postEnquiryWithInsert(
-      JSON.stringify(validEnquiry),
-      async () => ({
-        error: {
-          code: "42501",
-          message: 'new row violates row-level security policy for table "enquiries"',
-          details: "Failing row contains (...)",
-        },
-      })
-    );
+  const response = await postEnquiryWithInsert(
+    JSON.stringify(validEnquiry),
+    async () => ({
+      data: null,
+      error: {
+        code: "42501",
+        message: 'new row violates row-level security policy for table "enquiries"',
+        details: "Failing row contains (...)",
+      },
+    })
+  );
 
-    assert.equal(response.status, 500);
-    const body = await response.json();
-    assert.deepEqual(body, {
-      message: "Unable to submit your enquiry right now. Please try again later.",
-    });
-    assert.equal(JSON.stringify(body).includes("42501"), false);
-    assert.equal(JSON.stringify(body).includes("row-level security"), false);
-  } finally {
-    process.env.ENQUIRIES_ENABLED = previous;
-  }
+  assert.equal(response.status, 500);
+  const body = await response.json();
+  assert.deepEqual(body, {
+    message: "Unable to submit your enquiry right now. Please try again later.",
+  });
+  assert.equal(JSON.stringify(body).includes("42501"), false);
+  assert.equal(JSON.stringify(body).includes("row-level security"), false);
 });
 
 test("unexpected database exception returns 500 without exposing internal details", async () => {
-  const previous = process.env.ENQUIRIES_ENABLED;
-  process.env.ENQUIRIES_ENABLED = "true";
+  const response = await postEnquiryWithInsert(
+    JSON.stringify(validEnquiry),
+    async () => {
+      throw new Error("ECONNREFUSED 127.0.0.1:5432");
+    }
+  );
+
+  assert.equal(response.status, 500);
+  const body = await response.json();
+  assert.deepEqual(body, {
+    message: "Unable to submit your enquiry right now. Please try again later.",
+  });
+  assert.equal(JSON.stringify(body).includes("ECONNREFUSED"), false);
+});
+
+test("when ENQUIRIES_ENABLED is false, valid enquiry returns 201 without invoking insert", async () => {
+  const prev = process.env.ENQUIRIES_ENABLED;
+  process.env.ENQUIRIES_ENABLED = "false";
   try {
+    let called = false;
     const response = await postEnquiryWithInsert(
       JSON.stringify(validEnquiry),
       async () => {
-        throw new Error("ECONNREFUSED 127.0.0.1:5432");
+        called = true;
+        return { data: { id: "mock" }, error: null };
       }
     );
 
-    assert.equal(response.status, 500);
-    const body = await response.json();
-    assert.deepEqual(body, {
-      message: "Unable to submit your enquiry right now. Please try again later.",
-    });
-    assert.equal(JSON.stringify(body).includes("ECONNREFUSED"), false);
+    assert.equal(response.status, 201);
+    assert.equal(called, false);
   } finally {
-    process.env.ENQUIRIES_ENABLED = previous;
+    process.env.ENQUIRIES_ENABLED = prev;
   }
 });
