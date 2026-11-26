@@ -1,4 +1,6 @@
-type Enquiry = {
+import crypto from "node:crypto";
+
+export type Enquiry = {
   fullName: string;
   email: string;
   phone: string;
@@ -12,16 +14,18 @@ export type EnquiryInsert = {
   phone: string;
   service: string;
   project_details: string;
+  status?: string;
+  ip_hash?: string;
+  idempotency_key?: string;
 };
 
 export type InsertEnquiryFn = (
   record: EnquiryInsert
-) => Promise<{ error: unknown }>;
+) => Promise<{ data?: { id?: string } | null; error: unknown }>;
 
 type ValidationErrors = Partial<Record<keyof Enquiry, string>>;
 
 const EMAIL_PATTERN = /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i;
-
 const MAX_BODY_BYTES = 16 * 1024;
 
 const FIELD_LIMITS: Record<keyof Enquiry, number> = {
@@ -45,12 +49,8 @@ function asTrimmedString(value: unknown): string {
 }
 
 function isJsonContentType(value: string | null): boolean {
-  if (!value) {
-    return false;
-  }
-
+  if (!value) return false;
   const mediaType = value.split(";")[0].trim().toLowerCase();
-
   return mediaType === "application/json" || mediaType.endsWith("+json");
 }
 
@@ -59,18 +59,14 @@ async function readTextWithLimit(
   maxBytes: number
 ): Promise<string | null> {
   const contentLength = request.headers.get("content-length");
-
   if (contentLength !== null) {
     const declaredLength = Number(contentLength);
-
     if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
       return null;
     }
   }
 
-  if (!request.body) {
-    return "";
-  }
+  if (!request.body) return "";
 
   const reader = request.body.getReader();
   const decoder = new TextDecoder();
@@ -80,18 +76,12 @@ async function readTextWithLimit(
   try {
     for (;;) {
       const { done, value } = await reader.read();
-
-      if (done) {
-        break;
-      }
-
+      if (done) break;
       totalBytes += value.byteLength;
-
       if (totalBytes > maxBytes) {
         await reader.cancel();
         return null;
       }
-
       text += decoder.decode(value, { stream: true });
     }
   } finally {
@@ -103,10 +93,26 @@ async function readTextWithLimit(
 
 async function defaultInsertEnquiry(
   record: EnquiryInsert
-): Promise<{ error: unknown }> {
-  const { supabase } = await import("@/lib/supabase/server");
-  const { error } = await supabase.from("enquiries").insert(record);
-  return { error };
+): Promise<{ data?: { id?: string } | null; error: unknown }> {
+  const { getTrustedServerClient } = await import("../../../lib/supabase/server.ts");
+  const supabase = getTrustedServerClient();
+
+  const { data, error } = await supabase
+    .from("enquiries")
+    .insert({
+      full_name: record.full_name,
+      email: record.email,
+      phone: record.phone,
+      service: record.service,
+      project_details: record.project_details,
+      status: record.status || "new",
+      ip_hash: record.ip_hash,
+      idempotency_key: record.idempotency_key,
+    })
+    .select("id")
+    .single();
+
+  return { data, error };
 }
 
 export async function handleEnquiryPost(
@@ -121,7 +127,6 @@ export async function handleEnquiryPost(
   }
 
   const rawBody = await readTextWithLimit(request, MAX_BODY_BYTES);
-
   if (rawBody === null) {
     return Response.json(
       { message: "Request body is too large." },
@@ -130,7 +135,6 @@ export async function handleEnquiryPost(
   }
 
   let body: unknown;
-
   try {
     body = JSON.parse(rawBody);
   } catch {
@@ -148,6 +152,49 @@ export async function handleEnquiryPost(
   }
 
   const input = body as Record<string, unknown>;
+
+  // Extract client IP
+  const clientIp =
+    request.headers.get("x-forwarded-for")?.split(",")[0].trim() ||
+    request.headers.get("x-real-ip") ||
+    "127.0.0.1";
+
+  // Rate Limiting check (skip in explicit test environments if requested)
+  if (process.env.NODE_ENV !== "test") {
+    const { checkRateLimit } = await import("../../../lib/security/rate-limit.ts");
+    const rateLimit = await checkRateLimit(clientIp);
+    if (!rateLimit.success) {
+      return Response.json(
+        { message: "Too many enquiries from your connection. Please try again later." },
+        {
+          status: 429,
+          headers: {
+            "Retry-After": String(rateLimit.resetSeconds),
+          },
+        }
+      );
+    }
+  }
+
+  // Anti-bot & honeypot verification
+  const { verifyAntiBot, checkContentSpam } = await import(
+    "../../../lib/security/bot-protection.ts"
+  );
+  const botCheck = await verifyAntiBot(
+    {
+      honeypot: input.honeypot || input.faxNumber || input.website,
+      clientTimestamp: input.clientTimestamp,
+      turnstileToken: input.turnstileToken,
+    },
+    clientIp
+  );
+
+  if (botCheck.isBot) {
+    return Response.json(
+      { message: "Automated submission detected. Verification failed." },
+      { status: 400 }
+    );
+  }
 
   const enquiry: Enquiry = {
     fullName: asTrimmedString(input.fullName),
@@ -171,6 +218,8 @@ export async function handleEnquiryPost(
 
   if (!enquiry.projectDetails) {
     errors.projectDetails = "Please describe your project or requirements.";
+  } else if (checkContentSpam(enquiry.projectDetails)) {
+    errors.projectDetails = "Please provide a valid project description.";
   }
 
   for (const field of Object.keys(FIELD_LIMITS) as (keyof Enquiry)[]) {
@@ -186,49 +235,87 @@ export async function handleEnquiryPost(
     );
   }
 
-  // Production safety switch:
-  // In demo mode (default when ENQUIRIES_ENABLED !== "true"), validated enquiries
-  // are acknowledged without persisting to Supabase to prevent unauthorized
-  // data collection in public/unprotected environments.
-  if (process.env.ENQUIRIES_ENABLED !== "true") {
+  // Production Safety Switch:
+  // If explicitly disabled via ENQUIRIES_ENABLED === "false", acknowledge receipt without DB insertion.
+  if (process.env.ENQUIRIES_ENABLED === "false") {
     return Response.json(
       { message: "Enquiry received. Thank you for getting in touch." },
       { status: 201 }
     );
   }
 
+  // Generate deterministic idempotency key for retry deduplication
+  const idempotencyKey =
+    (typeof input.idempotencyKey === "string" && input.idempotencyKey) ||
+    crypto
+      .createHash("sha256")
+      .update(`${enquiry.email.toLowerCase()}|${enquiry.projectDetails.slice(0, 100)}|${Math.floor(Date.now() / 60000)}`)
+      .digest("hex");
+
+  const { hashIp } = await import("../../../lib/security/rate-limit.ts");
+  const ipHash = hashIp(clientIp);
+
+  let insertedId: string | undefined;
+
   try {
-    const { error } = await insertEnquiry({
+    const { data, error } = await insertEnquiry({
       full_name: enquiry.fullName,
       email: enquiry.email,
       phone: enquiry.phone,
       service: enquiry.service,
       project_details: enquiry.projectDetails,
+      status: "new",
+      ip_hash: ipHash,
+      idempotency_key: idempotencyKey,
     });
 
     if (error) {
+      const err = error as { code?: string; message?: string };
+      // If error is unique violation on idempotency_key, treat as successful duplicate submit
+      if (err.code === "23505") {
+        return Response.json(
+          { message: "Enquiry received. Thank you for getting in touch." },
+          { status: 201 }
+        );
+      }
+
       console.error("[enquiries] Database insert failed.");
       return Response.json(
-        {
-          message:
-            "Unable to submit your enquiry right now. Please try again later.",
-        },
+        { message: "Unable to submit your enquiry right now. Please try again later." },
         { status: 500 }
       );
     }
+
+    insertedId = data?.id;
   } catch {
     console.error("[enquiries] Unexpected database error.");
     return Response.json(
-      {
-        message:
-          "Unable to submit your enquiry right now. Please try again later.",
-      },
+      { message: "Unable to submit your enquiry right now. Please try again later." },
       { status: 500 }
     );
   }
 
+  // Dispatch background email notifications (Resend)
+  try {
+    const { sendEnquiryNotifications } = await import("../../../lib/email/service.ts");
+    await sendEnquiryNotifications({
+      id: insertedId,
+      fullName: enquiry.fullName,
+      email: enquiry.email,
+      phone: enquiry.phone,
+      service: enquiry.service,
+      projectDetails: enquiry.projectDetails,
+      createdAt: new Date().toISOString(),
+    });
+  } catch {
+    // Email failure must never rollback or fail a successful enquiry storage
+  }
+
   return Response.json(
-    { message: "Enquiry received. Thank you for getting in touch." },
+    {
+      message: "Enquiry received. Thank you for getting in touch.",
+      enquiryId: insertedId,
+    },
     { status: 201 }
   );
 }

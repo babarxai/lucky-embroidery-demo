@@ -1,18 +1,16 @@
-
 import "server-only";
 
-import { createClient } from "@supabase/supabase-js";
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabasePublishableKey = process.env.SUPABASE_PUBLISHABLE_KEY;
+const supabaseUrl = process.env.SUPABASE_URL || "https://placeholder.supabase.co";
+const supabasePublishableKey = process.env.SUPABASE_PUBLISHABLE_KEY || "placeholder-key";
+const supabaseSecretKey =
+  process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-if (!supabaseUrl || !supabasePublishableKey) {
-  throw new Error("Missing Supabase environment variables.");
-}
-
-export const supabase = createClient(
+// Trusted server-side client (prefers secret/service-role key, falls back to publishable)
+export const supabaseServer: SupabaseClient = createClient(
   supabaseUrl,
-  supabasePublishableKey,
+  supabaseSecretKey || supabasePublishableKey,
   {
     auth: {
       persistSession: false,
@@ -21,3 +19,10 @@ export const supabase = createClient(
     },
   }
 );
+
+// Backward compatibility export
+export const supabase = supabaseServer;
+
+export function getTrustedServerClient(): SupabaseClient {
+  return supabaseServer;
+}

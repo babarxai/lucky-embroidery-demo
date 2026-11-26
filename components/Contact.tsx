@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, ChangeEvent, FormEvent } from "react";
+import { useState, useRef, useEffect, ChangeEvent, FormEvent } from "react";
 
 interface FormData {
   fullName: string;
@@ -8,6 +8,7 @@ interface FormData {
   phone: string;
   service: string;
   projectDetails: string;
+  faxNumber: string; // Honeypot field
 }
 
 interface FormErrors {
@@ -23,10 +24,18 @@ export default function Contact() {
     phone: "",
     service: "",
     projectDetails: "",
+    faxNumber: "",
   });
 
   const [errors, setErrors] = useState<FormErrors>({});
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
   const [isSubmitted, setIsSubmitted] = useState(false);
+  const formLoadTimeRef = useRef<number>(0);
+
+  useEffect(() => {
+    formLoadTimeRef.current = Date.now();
+  }, []);
 
   const handleChange = (
     e: ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>
@@ -37,6 +46,9 @@ export default function Contact() {
     // Clear specific error on change
     if (errors[name as keyof FormErrors]) {
       setErrors((prev) => ({ ...prev, [name]: undefined }));
+    }
+    if (submitError) {
+      setSubmitError(null);
     }
   };
 
@@ -63,12 +75,56 @@ export default function Contact() {
     return Object.keys(newErrors).length === 0;
   };
 
-  const handleSubmit = (e: FormEvent<HTMLFormElement>) => {
+  const handleSubmit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
 
-    if (validate()) {
-      // Demo mode: Do not transmit or store customer data
-      setIsSubmitted(true);
+    if (!validate()) {
+      return;
+    }
+
+    setIsSubmitting(true);
+    setSubmitError(null);
+
+    try {
+      const response = await fetch("/api/enquiries", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          fullName: formData.fullName,
+          email: formData.email,
+          phone: formData.phone,
+          service: formData.service,
+          projectDetails: formData.projectDetails,
+          honeypot: formData.faxNumber,
+          clientTimestamp: formLoadTimeRef.current || Date.now(),
+        }),
+      });
+
+      const data = await response.json().catch(() => null);
+
+      if (response.status === 201) {
+        setIsSubmitted(true);
+      } else if (response.status === 400 && data?.errors) {
+        setErrors(data.errors);
+        setSubmitError(data.message || "Please fix the highlighted errors.");
+      } else if (response.status === 429) {
+        setSubmitError(
+          "You have submitted multiple enquiries recently. Please wait a while or call us directly at (832) 940-2320."
+        );
+      } else {
+        setSubmitError(
+          data?.message ||
+            "Unable to submit your enquiry right now. Please try again or call us at (832) 940-2320."
+        );
+      }
+    } catch {
+      setSubmitError(
+        "A network error occurred while submitting your enquiry. Please check your connection or call us at (832) 940-2320."
+      );
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -79,9 +135,12 @@ export default function Contact() {
       phone: "",
       service: "",
       projectDetails: "",
+      faxNumber: "",
     });
     setErrors({});
+    setSubmitError(null);
     setIsSubmitted(false);
+    formLoadTimeRef.current = Date.now();
   };
 
   return (
@@ -168,6 +227,29 @@ export default function Contact() {
               </p>
             </div>
 
+            {submitError && (
+              <div
+                role="alert"
+                className="mb-6 p-4 rounded-lg bg-red-50 border border-red-200 text-red-700 text-sm flex items-start gap-3"
+              >
+                <svg
+                  className="w-5 h-5 shrink-0 text-red-500 mt-0.5"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  strokeWidth={2}
+                  stroke="currentColor"
+                  aria-hidden="true"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z"
+                  />
+                </svg>
+                <span>{submitError}</span>
+              </div>
+            )}
+
             {isSubmitted ? (
               <div
                 role="status"
@@ -186,21 +268,18 @@ export default function Contact() {
                     <path
                       strokeLinecap="round"
                       strokeLinejoin="round"
-                      d="M11.25 11.25l.041-.02a.75.75 0 011.063.852l-.708 2.836a.75.75 0 001.063.853l.041-.021M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9-3.75h.008v.008H12V8.25z"
+                      d="M4.5 12.75l6 6 9-13.5"
                     />
                   </svg>
                 </div>
-                <h4 className="text-lg font-bold text-[#1F2933] mb-2">
-                  Demonstration Notice
+                <h4 className="text-xl font-bold text-[#1F2933] mb-2">
+                  Thank You for Your Enquiry!
                 </h4>
                 <p className="text-sm text-[#626B73] leading-relaxed mb-4 max-w-md mx-auto">
-                  Thank you for viewing this website redesign concept. This is an{" "}
-                  <strong>unofficial sales demonstration</strong>. No enquiry
-                  has been sent or stored, and this demo is not connected to Lucky
-                  Embroidery.
+                  We have received your project details. Our team will review your specifications and get in touch with a customized quote shortly.
                 </p>
                 <p className="text-sm text-[#1F2933] font-medium mb-6">
-                  To contact Lucky Embroidery directly, please call{" "}
+                  Need immediate assistance? Call us directly at{" "}
                   <a
                     href="tel:+18329402320"
                     className="text-[#496B80] underline hover:text-[#3d596b]"
@@ -212,13 +291,27 @@ export default function Contact() {
                 <button
                   type="button"
                   onClick={handleReset}
-                  className="inline-flex items-center justify-center px-6 py-2.5 rounded bg-[#496B80] text-white text-xs font-semibold tracking-wider uppercase hover:bg-[#3d596b] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#496B80] focus-visible:ring-offset-2"
+                  className="inline-flex items-center justify-center px-6 py-2.5 rounded bg-[#496B80] text-white text-xs font-semibold tracking-wider uppercase hover:bg-[#3d596b] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#496B80] focus-visible:ring-offset-2 cursor-pointer"
                 >
                   Submit Another Enquiry
                 </button>
               </div>
             ) : (
               <form onSubmit={handleSubmit} noValidate className="flex flex-col gap-4 w-full">
+                {/* Honeypot field for bot trapping (invisible to real users) */}
+                <div aria-hidden="true" style={{ display: "none" }}>
+                  <label htmlFor="faxNumber">Fax Number</label>
+                  <input
+                    type="text"
+                    id="faxNumber"
+                    name="faxNumber"
+                    tabIndex={-1}
+                    autoComplete="off"
+                    value={formData.faxNumber}
+                    onChange={handleChange}
+                  />
+                </div>
+
                 {/* 2 Columns on Desktop for Name & Email; Stacked on Mobile (<640px) */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 w-full">
                   {/* Full Name */}
@@ -235,6 +328,7 @@ export default function Contact() {
                       name="fullName"
                       value={formData.fullName}
                       onChange={handleChange}
+                      disabled={isSubmitting}
                       placeholder="Your full name"
                       aria-invalid={errors.fullName ? "true" : "false"}
                       aria-describedby={
@@ -244,7 +338,7 @@ export default function Contact() {
                         errors.fullName
                           ? "border-red-500 focus:ring-red-400"
                           : "border-[#E5E7EB] focus:ring-[#496B80]"
-                      } bg-white text-[#1F2933] placeholder:text-[#626B73]/60 focus:outline-none focus:ring-2 transition-all text-sm`}
+                      } bg-white text-[#1F2933] placeholder:text-[#626B73]/60 focus:outline-none focus:ring-2 transition-all text-sm disabled:opacity-60`}
                     />
                     {errors.fullName && (
                       <p
@@ -270,6 +364,7 @@ export default function Contact() {
                       name="email"
                       value={formData.email}
                       onChange={handleChange}
+                      disabled={isSubmitting}
                       placeholder="name@example.com"
                       aria-invalid={errors.email ? "true" : "false"}
                       aria-describedby={errors.email ? "email-error" : undefined}
@@ -277,7 +372,7 @@ export default function Contact() {
                         errors.email
                           ? "border-red-500 focus:ring-red-400"
                           : "border-[#E5E7EB] focus:ring-[#496B80]"
-                      } bg-white text-[#1F2933] placeholder:text-[#626B73]/60 focus:outline-none focus:ring-2 transition-all text-sm`}
+                      } bg-white text-[#1F2933] placeholder:text-[#626B73]/60 focus:outline-none focus:ring-2 transition-all text-sm disabled:opacity-60`}
                     />
                     {errors.email && (
                       <p
@@ -306,8 +401,9 @@ export default function Contact() {
                       name="phone"
                       value={formData.phone}
                       onChange={handleChange}
+                      disabled={isSubmitting}
                       placeholder="Your phone number"
-                      className="w-full px-4 py-3 rounded-lg border border-[#E5E7EB] bg-white text-[#1F2933] placeholder:text-[#626B73]/60 focus:outline-none focus:ring-2 focus:ring-[#496B80] transition-all text-sm"
+                      className="w-full px-4 py-3 rounded-lg border border-[#E5E7EB] bg-white text-[#1F2933] placeholder:text-[#626B73]/60 focus:outline-none focus:ring-2 focus:ring-[#496B80] transition-all text-sm disabled:opacity-60"
                     />
                   </div>
 
@@ -325,7 +421,8 @@ export default function Contact() {
                         name="service"
                         value={formData.service}
                         onChange={handleChange}
-                        className="w-full px-4 py-3 rounded-lg border border-[#E5E7EB] bg-white text-[#1F2933] focus:outline-none focus:ring-2 focus:ring-[#496B80] transition-all text-sm appearance-none cursor-pointer pr-10"
+                        disabled={isSubmitting}
+                        className="w-full px-4 py-3 rounded-lg border border-[#E5E7EB] bg-white text-[#1F2933] focus:outline-none focus:ring-2 focus:ring-[#496B80] transition-all text-sm appearance-none cursor-pointer pr-10 disabled:opacity-60"
                       >
                         <option value="" disabled>
                           Select a service
@@ -371,6 +468,7 @@ export default function Contact() {
                     rows={4}
                     value={formData.projectDetails}
                     onChange={handleChange}
+                    disabled={isSubmitting}
                     placeholder="Tell us about your project, quantity and requirements..."
                     aria-invalid={errors.projectDetails ? "true" : "false"}
                     aria-describedby={
@@ -380,7 +478,7 @@ export default function Contact() {
                       errors.projectDetails
                         ? "border-red-500 focus:ring-red-400"
                         : "border-[#E5E7EB] focus:ring-[#496B80]"
-                    } bg-white text-[#1F2933] placeholder:text-[#626B73]/60 focus:outline-none focus:ring-2 transition-all text-sm resize-none`}
+                    } bg-white text-[#1F2933] placeholder:text-[#626B73]/60 focus:outline-none focus:ring-2 transition-all text-sm resize-none disabled:opacity-60`}
                   />
                   {errors.projectDetails && (
                     <p
@@ -396,9 +494,36 @@ export default function Contact() {
                 <div className="w-full">
                   <button
                     type="submit"
-                    className="w-full py-4 rounded bg-[#496B80] text-white text-sm font-semibold tracking-wider uppercase hover:bg-[#3d596b] transition-all shadow-sm hover:shadow focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#496B80] focus-visible:ring-offset-2 cursor-pointer"
+                    disabled={isSubmitting}
+                    className="w-full py-4 rounded bg-[#496B80] text-white text-sm font-semibold tracking-wider uppercase hover:bg-[#3d596b] transition-all shadow-sm hover:shadow focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#496B80] focus-visible:ring-offset-2 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-2"
                   >
-                    SUBMIT ENQUIRY
+                    {isSubmitting ? (
+                      <>
+                        <svg
+                          className="animate-spin h-4 w-4 text-white"
+                          xmlns="http://www.w3.org/2000/svg"
+                          fill="none"
+                          viewBox="0 0 24 24"
+                        >
+                          <circle
+                            className="opacity-25"
+                            cx="12"
+                            cy="12"
+                            r="10"
+                            stroke="currentColor"
+                            strokeWidth="4"
+                          ></circle>
+                          <path
+                            className="opacity-75"
+                            fill="currentColor"
+                            d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                          ></path>
+                        </svg>
+                        <span>SUBMITTING...</span>
+                      </>
+                    ) : (
+                      "SUBMIT ENQUIRY"
+                    )}
                   </button>
                 </div>
               </form>
@@ -409,4 +534,3 @@ export default function Contact() {
     </section>
   );
 }
-
